@@ -33,9 +33,15 @@ jobs:
 
       - name: 📥 Fetch Flutter Engine Source
         run: |
-          mkdir engine
-          cd engine
+          mkdir -p engine/src/flutter
+          cd engine/src/flutter
+          git init
+          git remote add origin https://github.com/flutter/engine.git
+          git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+          git fetch origin --prune --progress
+          git checkout ${{ github.event.inputs.engine_hash }}
           
+          cd ../../
           cat <<EOF > .gclient
           solutions = [
             {
@@ -49,11 +55,7 @@ jobs:
           ]
           EOF
           
-          gclient sync -v
-          
-          cd src/flutter
-          git fetch origin ${{ github.event.inputs.engine_hash }} || true
-          git checkout ${{ github.event.inputs.engine_hash }}
+          gclient sync -v --no-history -D
 
       - name: 🔓 Apply SSL Pinning Bypass Patch
         run: |
