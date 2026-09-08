@@ -4,10 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       engine_hash:
-        description: 'Exact Engine Commit Hash for 3.12.2'
+        description: 'Exact Engine Commit Hash for 3.44.8'
         required: true
-        # Replace this default with the actual hash for 3.12.2
-        default: 'INSERT_COMMIT_HASH_HERE' 
+        default: '0cd610717bde95fd88343c64f81c11ba4e5c0010' 
 
 jobs:
   build:
@@ -37,13 +36,12 @@ jobs:
           mkdir engine
           cd engine
           
-          # Create gclient config targeting your specific commit hash
           cat <<EOF > .gclient
           solutions = [
             {
               "managed": False,
               "name": "src/flutter",
-              "url": "https://github.com/flutter/engine.git@${{ github.event.inputs.engine_hash }}",
+              "url": "https://github.com/flutter/engine.git",
               "custom_deps": {},
               "deps_file": "DEPS",
               "safesync_url": "",
@@ -51,18 +49,16 @@ jobs:
           ]
           EOF
           
-          # Sync all dependencies (This will take 15-30 minutes)
-          gclient sync -v --no-history -D
+          gclient sync -v
+          
+          cd src/flutter
+          git fetch origin ${{ github.event.inputs.engine_hash }} || true
+          git checkout ${{ github.event.inputs.engine_hash }}
 
       - name: 🔓 Apply SSL Pinning Bypass Patch
         run: |
-          # Navigate to Dart's security context source where SSL verification happens
           cd engine/src/third_party/dart/runtime/bin
-          
-          # Force BoringSSL certificate validation to return OK (success) instead of invalid
           sed -i 's/return ssl_verify_invalid;/return ssl_verify_ok;/g' security_context.cc
-          
-          # Also patch the Linux/Android specific context if present
           if [ -f "security_context_linux.cc" ]; then
             sed -i 's/return ssl_verify_invalid;/return ssl_verify_ok;/g' security_context_linux.cc
           fi
@@ -75,7 +71,6 @@ jobs:
       - name: 🔨 Compile Engine (Ninja)
         run: |
           cd engine/src
-          # Utilize all CPU cores for faster compilation
           ninja -C out/android_release_arm64 -j$(nproc)
 
       - name: 📤 Upload Patched libflutter.so Artifact
