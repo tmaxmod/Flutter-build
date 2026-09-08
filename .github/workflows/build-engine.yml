@@ -30,12 +30,13 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
-          root-reserve-mb: 20480
+          root-reserve-mb: 4096
           swap-size-mb: 4096
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
           remove-codeql: "true"
+          remove-docker-images: "true"
 
       - name: Install build dependencies
         run: |
@@ -56,17 +57,19 @@ jobs:
           echo "$HOME/depot_tools" >> $GITHUB_PATH
 
       # ---------------------------------------------------------------
-      # 2. FULL clone of flutter/flutter and checkout the tag.
+      # 2. Partial clone of flutter/flutter and checkout the tag.
       #    Engine source lives inside this repo at engine/src/flutter
       #    (monorepo layout) — no separate flutter/engine repo needed,
       #    no engine.version hash juggling, no ref errors.
+      #    --filter=blob:none keeps the clone small (full history of
+      #    blobs is NOT downloaded, only what the tag checkout needs).
       # ---------------------------------------------------------------
-      - name: Clone flutter (full) and checkout tag
+      - name: Clone flutter (partial) and checkout tag
         run: |
           TAG="${{ inputs.flutter_version }}"
           echo "Targeting Flutter tag: $TAG"
 
-          git clone https://github.com/flutter/flutter.git "$WORK_DIR"
+          git clone --filter=blob:none https://github.com/flutter/flutter.git "$WORK_DIR"
           cd "$WORK_DIR"
 
           if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
@@ -76,6 +79,9 @@ jobs:
           git checkout "$TAG"
           echo "Checked out: $(git rev-parse HEAD)"
           test -f engine/scripts/standard.gclient || { echo "::error::monorepo engine/ layout not found at this tag"; exit 1; }
+
+      - name: Disk usage after clone
+        run: df -h /
 
       # ---------------------------------------------------------------
       # 3. .gclient at the repo root (monorepo standard config)
@@ -100,17 +106,45 @@ jobs:
           EOF
 
       # ---------------------------------------------------------------
-      # 4. gclient sync — fetches buildroot, Dart, BoringSSL, NDK, etc.
-      #    managed:False means it never touches our checkout
+      # 4. gclient sync — retries built in for googlesource throttling
       # ---------------------------------------------------------------
       - name: gclient sync
         working-directory: ${{ env.WORK_DIR }}
         run: |
-          gclient sync --nohooks --verbose
+          git config --global http.postBuffer 524288000
+          for attempt in 1 2 3 4; do
+            echo "=== gclient sync attempt $attempt ==="
+            if gclient sync \
+                --nohooks \
+                --verbose \
+                --force \
+                --reset \
+                --retry-failed-fetch \
+                --shallow \
+                -j4; then
+              echo "gclient sync succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              echo "::error::gclient sync failed after 4 attempts"
+              exit 1
+            fi
+            echo "Attempt $attempt failed — waiting 90s before retry..."
+            sleep 90
+          done
           gclient runhooks
 
       # ---------------------------------------------------------------
-      # 5. Patch BoringSSL: force certificate chain verification to OK
+      # 5. Free space: git history no longer needed after sync
+      # ---------------------------------------------------------------
+      - name: Free space — remove .git after sync
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          rm -rf .git
+          df -h /
+
+      # ---------------------------------------------------------------
+      # 6. Patch BoringSSL: force certificate chain verification to OK
       # ---------------------------------------------------------------
       - name: Patch BoringSSL ssl_verify_cert_chain
         working-directory: ${{ env.WORK_DIR }}
@@ -159,7 +193,7 @@ jobs:
           PYEOF
 
       # ---------------------------------------------------------------
-      # 6. GN + Ninja (build from engine/src in monorepo layout)
+      # 7. GN + Ninja (build from engine/src in monorepo layout)
       # ---------------------------------------------------------------
       - name: GN (configure)
         working-directory: ${{ env.WORK_DIR }}/engine/src
@@ -174,9 +208,10 @@ jobs:
         working-directory: ${{ env.WORK_DIR }}/engine/src
         run: |
           ninja -C out/android_${{ inputs.runtime_mode }}_arm64
+          df -h /
 
       # ---------------------------------------------------------------
-      # 7. Upload artifact
+      # 8. Upload artifact
       # ---------------------------------------------------------------
       - name: Upload libflutter.so
         uses: actions/upload-artifact@v4
