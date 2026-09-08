@@ -84,7 +84,7 @@ jobs:
       - name: Disk usage after clone
         run: df -h /
 
-      # ---------------------------------------------------------------
+            # ---------------------------------------------------------------
       # 3. .gclient at the repo root (monorepo standard config)
       # ---------------------------------------------------------------
       - name: Write .gclient
@@ -101,10 +101,15 @@ jobs:
               "url": "https://github.com/flutter/flutter.git",
               "custom_vars": {
                 "download_emsdk": False,
+                "download_fuchsia_deps": False,
+                "download_ios_deps": False,
+                "download_mac_deps": False,
+                "download_windows_deps": False,
               },
             },
           ]
           EOF
+
 
             # ---------------------------------------------------------------
       # 4. gclient sync — retries built in for googlesource throttling
