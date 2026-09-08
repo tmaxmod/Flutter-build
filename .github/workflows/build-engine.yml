@@ -1,0 +1,85 @@
+name: Build Custom Patched Flutter Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine_hash:
+        description: 'Exact Engine Commit Hash for 3.12.2'
+        required: true
+        # Replace this default with the actual hash for 3.12.2
+        default: 'INSERT_COMMIT_HASH_HERE' 
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 🧹 Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          remove-android: 'false'
+          remove-dotnet: 'true'
+          remove-haskell: 'true'
+          remove-docker-images: 'true'
+
+      - name: 📦 Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl git python3 pkg-config ninja-build
+
+      - name: 🛠️ Setup Google Depot Tools
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
+
+      - name: 📥 Fetch Flutter Engine Source
+        run: |
+          mkdir engine
+          cd engine
+          
+          # Create gclient config targeting your specific commit hash
+          cat <<EOF > .gclient
+          solutions = [
+            {
+              "managed": False,
+              "name": "src/flutter",
+              "url": "https://github.com/flutter/engine.git@${{ github.event.inputs.engine_hash }}",
+              "custom_deps": {},
+              "deps_file": "DEPS",
+              "safesync_url": "",
+            },
+          ]
+          EOF
+          
+          # Sync all dependencies (This will take 15-30 minutes)
+          gclient sync -v --no-history -D
+
+      - name: 🔓 Apply SSL Pinning Bypass Patch
+        run: |
+          # Navigate to Dart's security context source where SSL verification happens
+          cd engine/src/third_party/dart/runtime/bin
+          
+          # Force BoringSSL certificate validation to return OK (success) instead of invalid
+          sed -i 's/return ssl_verify_invalid;/return ssl_verify_ok;/g' security_context.cc
+          
+          # Also patch the Linux/Android specific context if present
+          if [ -f "security_context_linux.cc" ]; then
+            sed -i 's/return ssl_verify_invalid;/return ssl_verify_ok;/g' security_context_linux.cc
+          fi
+
+      - name: ⚙️ Configure Build (GN)
+        run: |
+          cd engine/src
+          ./flutter/tools/gn --android --android-cpu=arm64 --runtime-mode=release
+
+      - name: 🔨 Compile Engine (Ninja)
+        run: |
+          cd engine/src
+          # Utilize all CPU cores for faster compilation
+          ninja -C out/android_release_arm64 -j$(nproc)
+
+      - name: 📤 Upload Patched libflutter.so Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-libflutter-arm64
+          path: engine/src/out/android_release_arm64/libflutter.so
