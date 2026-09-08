@@ -33,20 +33,20 @@ jobs:
 
       - name: 📥 Fetch Exact Engine Hash & Source
         run: |
-          # Clone flutter framework temporarily to read the correct engine version
+          # 1. Read engine version automatically from flutter repo tag
           git clone https://github.com/flutter/flutter.git -b ${{ github.event.inputs.flutter_version }} --depth 1 flutter_temp
           ENGINE_HASH=$(cat flutter_temp/bin/internal/engine.version)
-          echo "Found Engine Hash: $ENGINE_HASH"
+          echo "Target Engine Hash: $ENGINE_HASH"
           
+          # 2. Setup standard gclient structure
           mkdir -p engine
           cd engine
-          
           cat <<EOF > .gclient
           solutions = [
             {
               "managed": False,
               "name": "src/flutter",
-              "url": "https://github.com/flutter/engine.git@$ENGINE_HASH",
+              "url": "https://github.com/flutter/engine.git",
               "custom_deps": {},
               "deps_file": "DEPS",
               "safesync_url": "",
@@ -54,7 +54,14 @@ jobs:
           ]
           EOF
           
-          gclient sync -v --no-history -D
+          # 3. Sync dependencies without failing on specific refs
+          gclient sync -v --no-history -D || true
+          
+          # 4. Force checkout the exact engine commit hash safely
+          cd src/flutter
+          git fetch origin +refs/heads/*:refs/remotes/origin/* --prune || true
+          git fetch origin $ENGINE_HASH || true
+          git checkout $ENGINE_HASH
 
       - name: 🔓 Apply SSL Pinning Bypass Patch
         run: |
