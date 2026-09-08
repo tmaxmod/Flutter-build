@@ -3,10 +3,10 @@ name: Build Custom Patched Flutter Engine
 on:
   workflow_dispatch:
     inputs:
-      engine_hash:
-        description: 'Exact Engine Commit Hash for 3.44.8'
+      flutter_version:
+        description: 'Flutter Tag or Commit (e.g. 3.44.8)'
         required: true
-        default: '0cd610717bde95fd88343c64f81c11ba4e5c0010' 
+        default: '3.44.8' 
 
 jobs:
   build:
@@ -31,23 +31,22 @@ jobs:
           git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
           echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
 
-      - name: 📥 Fetch Flutter Engine Source
+      - name: 📥 Fetch Exact Engine Hash & Source
         run: |
-          mkdir -p engine/src/flutter
-          cd engine/src/flutter
-          git init
-          git remote add origin https://github.com/flutter/engine.git
-          git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
-          git fetch origin --prune --progress
-          git checkout ${{ github.event.inputs.engine_hash }}
+          # Clone flutter framework temporarily to read the correct engine version
+          git clone https://github.com/flutter/flutter.git -b ${{ github.event.inputs.flutter_version }} --depth 1 flutter_temp
+          ENGINE_HASH=$(cat flutter_temp/bin/internal/engine.version)
+          echo "Found Engine Hash: $ENGINE_HASH"
           
-          cd ../../
+          mkdir -p engine
+          cd engine
+          
           cat <<EOF > .gclient
           solutions = [
             {
               "managed": False,
               "name": "src/flutter",
-              "url": "https://github.com/flutter/engine.git",
+              "url": "https://github.com/flutter/engine.git@$ENGINE_HASH",
               "custom_deps": {},
               "deps_file": "DEPS",
               "safesync_url": "",
