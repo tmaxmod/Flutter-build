@@ -1,88 +1,206 @@
-name: Build Custom Patched Flutter Engine
+name: Build patched libflutter.so (Android arm64, release)
 
 on:
   workflow_dispatch:
     inputs:
       flutter_version:
-        description: 'Flutter Tag or Commit (e.g. 3.44.8)'
+        description: "Flutter tag to target (must exist in flutter/flutter), e.g. 3.44.8"
         required: true
-        default: '3.44.8' 
+        default: "3.44.8"
+      runtime_mode:
+        description: "Engine runtime mode"
+        required: true
+        type: choice
+        options: [release, profile]
+        default: release
+
+env:
+  DEPOT_TOOLS_UPDATE: "0"
+  GIT_CACHE_PATH: ${{ github.workspace }}/.git-cache
+  ENGINE_DIR: ${{ github.workspace }}/engine-work
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
-    steps:
-      - name: 🧹 Maximize Build Space
-        uses: easimon/maximize-build-space@master
-        with:
-          remove-android: 'false'
-          remove-dotnet: 'true'
-          remove-haskell: 'true'
-          remove-docker-images: 'true'
+    timeout-minutes: 360
 
-      - name: 📦 Install System Dependencies
+    steps:
+      # ---------------------------------------------------------------
+      # 0. Free up disk (engine builds need ~40+ GB)
+      # ---------------------------------------------------------------
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 20480
+          swap-size-mb: 4096
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl git python3 pkg-config ninja-build
+          sudo apt-get install -y --no-install-recommends \
+            git curl wget python3 python3-pip python3-venv \
+            build-essential ninja-build pkg-config \
+            openjdk-17-jdk-headless unzip zip xz-utils \
+            libgl1-mesa-dev libegl1-mesa-dev
+          git config --global gc.auto 0
+          git config --global fetch.prune false
 
-      - name: 🛠️ Setup Google Depot Tools
+      # ---------------------------------------------------------------
+      # 1. depot_tools
+      # ---------------------------------------------------------------
+      - name: Checkout depot_tools
         run: |
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools
+          echo "$HOME/depot_tools" >> $GITHUB_PATH
 
-      - name: 📥 Fetch Exact Engine Hash & Source
+      # ---------------------------------------------------------------
+      # 2. Resolve the exact engine commit for the Flutter tag
+      #    (fails fast with a clear message if the tag doesn't exist)
+      # ---------------------------------------------------------------
+      - name: Resolve engine commit from Flutter tag
+        id: resolve
         run: |
-          # 1. Read engine version automatically from flutter repo tag
-          git clone https://github.com/flutter/flutter.git -b ${{ github.event.inputs.flutter_version }} --depth 1 flutter_temp
-          ENGINE_HASH=$(cat flutter_temp/bin/internal/engine.version)
-          echo "Target Engine Hash: $ENGINE_HASH"
-          
-          # 2. Setup standard gclient structure
-          mkdir -p engine
-          cd engine
-          cat <<EOF > .gclient
+          TAG="${{ inputs.flutter_version }}"
+          echo "Targeting Flutter tag: $TAG"
+
+          if ! git ls-remote --tags https://github.com/flutter/flutter "refs/tags/$TAG" | grep -q "$TAG"; then
+            echo "::error::Tag '$TAG' not found in flutter/flutter. Check https://github.com/flutter/flutter/tags"
+            exit 1
+          fi
+
+          git clone --depth 1 --branch "$TAG" https://github.com/flutter/flutter flutter-sdk
+          ENGINE_COMMIT=$(cat flutter-sdk/bin/internal/engine.version | tr -d '[:space:]')
+          if [ -z "$ENGINE_COMMIT" ]; then
+            echo "::error::bin/internal/engine.version is empty"
+            exit 1
+          fi
+          echo "ENGINE_COMMIT=$ENGINE_COMMIT"
+          echo "engine_commit=$ENGINE_COMMIT" >> $GITHUB_OUTPUT
+          rm -rf flutter-sdk
+
+      # ---------------------------------------------------------------
+      # 3. .gclient with managed:False  ->  gclient will NEVER touch
+      #    the engine checkout, so no ref/hash lookup errors are possible
+      # ---------------------------------------------------------------
+      - name: Write .gclient
+        run: |
+          mkdir -p "$ENGINE_DIR"
+          cat > "$ENGINE_DIR/.gclient" <<'EOF'
           solutions = [
             {
-              "managed": False,
               "name": "src/flutter",
               "url": "https://github.com/flutter/engine.git",
+              "managed": False,
               "custom_deps": {},
-              "deps_file": "DEPS",
-              "safesync_url": "",
+              "custom_vars": {
+                "download_emsdk": False,
+                "download_font_subset": False,
+              },
             },
           ]
           EOF
-          
-          # 3. Sync dependencies without failing on specific refs
-          gclient sync -v --no-history -D || true
-          
-          # 4. Force checkout the exact engine commit hash safely
-          cd src/flutter
-          git fetch origin +refs/heads/*:refs/remotes/origin/* --prune || true
-          git fetch origin $ENGINE_HASH || true
-          git checkout $ENGINE_HASH
 
-      - name: 🔓 Apply SSL Pinning Bypass Patch
+      # ---------------------------------------------------------------
+      # 4. FULL clone of the engine, then checkout the resolved commit.
+      #    Full clone = every object present locally = no 'not our ref',
+      #    no 'unable to read tree', works with any hash, shallow or not.
+      # ---------------------------------------------------------------
+      - name: Clone engine (full) and checkout engine commit
+        working-directory: ${{ env.ENGINE_DIR }}
         run: |
-          cd engine/src/third_party/dart/runtime/bin
-          sed -i 's/return ssl_verify_invalid;/return ssl_verify_ok;/g' security_context.cc
-          if [ -f "security_context_linux.cc" ]; then
-            sed -i 's/return ssl_verify_invalid;/return ssl_verify_ok;/g' security_context_linux.cc
-          fi
+          git clone https://github.com/flutter/engine.git src/flutter
+          git -C src/flutter checkout "${{ steps.resolve.outputs.engine_commit }}"
+          echo "Engine HEAD: $(git -C src/flutter rev-parse HEAD)"
 
-      - name: ⚙️ Configure Build (GN)
+      # ---------------------------------------------------------------
+      # 5. gclient sync — fetches all DEPS deps; skips the engine repo
+      #    itself because managed is False
+      # ---------------------------------------------------------------
+      - name: gclient sync (dependencies only)
+        working-directory: ${{ env.ENGINE_DIR }}
         run: |
-          cd engine/src
-          ./flutter/tools/gn --android --android-cpu=arm64 --runtime-mode=release
+          gclient sync --nohooks --verbose
+          gclient runhooks
 
-      - name: 🔨 Compile Engine (Ninja)
+      # ---------------------------------------------------------------
+      # 6. Patch BoringSSL: force certificate chain verification to OK
+      #    Tries both known file locations (BoringSSL moved the function
+      #    between releases). Fails the build if the patch can't apply.
+      # ---------------------------------------------------------------
+      - name: Patch BoringSSL ssl_verify_cert_chain
+        working-directory: ${{ env.ENGINE_DIR }}
         run: |
-          cd engine/src
-          ninja -C out/android_release_arm64 -j$(nproc)
+          python3 - <<'PYEOF'
+          import re, sys, pathlib
 
-      - name: 📤 Upload Patched libflutter.so Artifact
+          candidates = [
+              "src/flutter/third_party/boringssl/src/ssl/ssl_x509.cc",
+              "src/flutter/third_party/boringssl/src/ssl/ssl_cert.cc",
+          ]
+
+          # Matches the function definition regardless of line breaks/const-qualifiers
+          fn_re = re.compile(
+              r'(enum\s+ssl_verify_result_t\s+ssl_verify_cert_chain\s*\(\s*'
+              r'SSL\s*\*\s*ssl\s*,\s*STACK_OF\(X509\)\s*\*\s*cert_chain\s*\)'
+              r'[^{]*\{\s*)',
+              re.MULTILINE,
+          )
+
+          patched = False
+          for f in candidates:
+              p = pathlib.Path(f)
+              if not p.exists():
+                  print(f"[skip] {f} not present")
+                  continue
+              src = p.read_text()
+              m = fn_re.search(src)
+              if not m:
+                  print(f"[skip] ssl_verify_cert_chain not found in {f}")
+                  continue
+              if "ssl_bypass_patch" in src:
+                  print(f"[skip] already patched: {f}")
+                  patched = True
+                  break
+              new_src = src[:m.end(1)] + "\n  return ssl_verify_ok;  // ssl_bypass_patch\n" + src[m.end(1):]
+              p.write_text(new_src)
+              print(f"[ok] patched {f}")
+              patched = True
+              break
+
+          if not patched:
+              print("::error::Could not locate ssl_verify_cert_chain — "
+                    "BoringSSL layout may have changed. Inspect "
+                    "third_party/boringssl/src/ssl/ and update the patch paths.")
+              sys.exit(1)
+          PYEOF
+
+      # ---------------------------------------------------------------
+      # 7. Generate ninja files and build (arm64 release)
+      # ---------------------------------------------------------------
+      - name: GN (configure)
+        working-directory: ${{ env.ENGINE_DIR }}/src
+        run: |
+          ./flutter/tools/gn \
+            --android \
+            --android-cpu=arm64 \
+            --runtime-mode=${{ inputs.runtime_mode }} \
+            --no-lto
+
+      - name: Ninja build libflutter.so
+        working-directory: ${{ env.ENGINE_DIR }}/src
+        run: |
+          ninja -C out/android_${{ inputs.runtime_mode }}_arm64
+
+      # ---------------------------------------------------------------
+      # 8. Upload artifact
+      # ---------------------------------------------------------------
+      - name: Upload libflutter.so
         uses: actions/upload-artifact@v4
         with:
-          name: patched-libflutter-arm64
-          path: engine/src/out/android_release_arm64/libflutter.so
+          name: libflutter-android-arm64-${{ inputs.runtime_mode }}-${{ inputs.flutter_version }}
+          path: ${{ env.ENGINE_DIR }}/src/out/android_${{ inputs.runtime_mode }}_arm64/libflutter.so
+          if-no-files-found: error
